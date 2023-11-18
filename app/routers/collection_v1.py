@@ -1,13 +1,18 @@
+import asyncio
+import io
 from typing import Annotated
 
-from fastapi import APIRouter, Body, status, UploadFile
+from fastapi import APIRouter, Body, status, UploadFile, Form, File
+from pypdf import PdfReader
 from pgml import Collection, Model, Pipeline, Splitter
 from FlagEmbedding import FlagReranker
 from pydantic import BaseModel
 from markdown import markdown
 from bs4 import BeautifulSoup
-from ctransformers import AutoModelForCausalLM
-
+from ctransformers import AutoModelForCausalLM, LLM, AutoConfig, Config
+from fastapi.responses import StreamingResponse
+import numpy as np
+import json
 
 example_documents = [
         {
@@ -22,6 +27,21 @@ example_documents = [
         }
     ]
 
+user_message = """
+Based on documents listed below answer the following question: {query}
+###
+Documents
+###
+{context}
+"""
+
+chatbot_input_string = """<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+{user_message}<|im_end|>
+<|im_start|>assistant"""
+
+
 router = APIRouter(
     prefix="/collections",
     tags=["collections"]
@@ -33,33 +53,52 @@ class RelevantDocument(BaseModel):
     content: str
 
 
+class Prompt(BaseModel):
+    collection_name: str
+    pipeline_name: str
+    query: str
+    limit: int
+
+
+class PromptStreamingResponse(BaseModel):
+    response: str
+
+
 @router.post("/documents/upsert")
-async def upsert_documents(collection_name: str, documents: Annotated[list[dict], Body(examples=example_documents)]) -> bool:
+async def upsert_documents(collection_name: str, documents: Annotated[list[dict], Body(examples=example_documents)]) -> None:
     collection = Collection(collection_name)
-    await collection.upsert_documents(documents)
-    is_created = await collection.exists()
-    return status.HTTP_201_CREATED if is_created else status.HTTP_417_EXPECTATION_FAILED
+    return await collection.upsert_documents(documents)
 
 
 @router.post("/documents/upload")
-async def upload_document(collection_name: str, document: UploadFile):
+async def upload_document(collection_name: Annotated[str, Form()], file_type: Annotated[str, Form()], document: Annotated[UploadFile, File()]):
     collection = Collection(collection_name)
     contents = await document.read()
-    html = markdown(contents)
-    text = ''.join(BeautifulSoup(html, features='html.parser').find_all(text=True))
-    documents = [{
-        "id": document.filename,
-        "text": str(text),
-    }]
-    await collection.upsert_documents(documents)
+    if file_type == "markdown":
+        html = markdown(contents)
+        text = ''.join(BeautifulSoup(html, features='html.parser').find_all(text=True))
+        documents = [{
+            "id": document.filename,
+            "text": str(text),
+        }]
+
+        await collection.upsert_documents(documents)
+    else:
+        reader = PdfReader(io.BytesIO(contents))
+        for page in reader.pages:
+            documents = [{
+                "id": document.filename,
+                "text": page.extract_text(),
+            }]
+            await collection.upsert_documents(documents)
+
     return status.HTTP_200_OK
 
 
 @router.get("/documents/retrieve")
 async def retrieve_documents(collection_name: str):
     collection = Collection(collection_name)
-    documents = await collection.get_documents({"limit": 100})
-    return documents
+    return await collection.get_documents({"limit": 100})
 
 
 @router.post("/documents/embed")
@@ -73,14 +112,7 @@ async def embed(collection_name: str, pipeline_name: str = "embedding_pipeline",
 
 @router.post("/documents/query")
 async def query_documents(collection_name: str, query: str, pipeline_name: str, limit: int):
-    collection = Collection(collection_name)
-    pipeline = await collection.get_pipeline(pipeline_name)
-    results = await collection.query().vector_recall(query, pipeline).limit(limit).fetch_all()
-
-    reranker = FlagReranker('BAAI/bge-reranker-base')
-    mapped_results: list[tuple[str, str]] = [(query, result[1])for result in results]
-    scores = reranker.compute_score(mapped_results)
-    return zip(scores, results)
+    return await find_most_relevant_document(collection_name, query, pipeline_name, limit)
 
 
 @router.delete("/archive")
@@ -90,12 +122,35 @@ async def archive_collection(collection_name: str):
 
 
 @router.post("/chat/query")
-async def chat_with_model():
-    select_string = \
-        """"<|im_start|>system
-        You are a helpful assistant<|im_end|>
-        <|im_start|>user
-        Can you introduce yourself?<|im_end|>
-        <|im_start|>assistant"""
-    model = AutoModelForCausalLM.from_pretrained("TheBloke/Mistral-7B-OpenOrca-GGUF", model_file="mistral-7b-openorca.Q4_K_M.gguf", model_type="mistral", gpu_layers=0)
-    return model(select_string, max_new_tokens=256, temperature=0.8, repetition_penalty=1.1, stream=True)
+async def chat_with_model(prompt: Prompt):
+    relevant_document = await find_most_relevant_document(prompt.collection_name, prompt.pipeline_name, prompt.query, prompt.limit)
+    formatted_user_message = user_message.format(query=prompt.query, context=relevant_document)
+    model_input_string = chatbot_input_string.format(user_message=formatted_user_message)
+
+    config = Config(max_new_tokens=256, context_length=3000, stop=["<|im_end|>"])
+    auto_config = AutoConfig(config=config)
+    model = AutoModelForCausalLM.from_pretrained("TheBloke/Mistral-7B-OpenOrca-GGUF", model_file="mistral-7b-openorca.Q4_K_M.gguf", model_type="mistral", gpu_layers=0, config=auto_config)
+    return StreamingResponse(chat_model_response_streamer(model, model_input_string), media_type="application/json")
+
+
+async def chat_model_response_streamer(model: LLM, query: str):
+    for chunk in model(query):
+        yield json.dumps({"response": chunk})
+        await asyncio.sleep(0.1)
+
+
+async def find_most_relevant_document(collection_name: str, pipeline_name: str, query: str, limit: int):
+    collection = Collection(collection_name)
+    pipeline = await collection.get_pipeline(pipeline_name)
+    results = await collection.query().vector_recall(query, pipeline).limit(limit).fetch_all()
+
+    reranker = FlagReranker('BAAI/bge-reranker-base')
+    mapped_results: list[tuple[str, str]] = [(query, result[1]) for result in results]
+    scores = reranker.compute_score(mapped_results)
+    best_doc = np.argmax(scores)
+    return results[best_doc][1]
+
+
+@router.get("/models")
+async def get_models():
+    return "mistral"
