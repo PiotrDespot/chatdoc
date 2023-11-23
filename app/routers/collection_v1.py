@@ -1,8 +1,12 @@
 import asyncio
 import io
+import os
 from typing import Annotated
 
-from fastapi import APIRouter, Body, status, UploadFile, Form, File
+from app.confluence_importer import ConfluenceImporter
+from fastapi import APIRouter, Body, status, UploadFile, Form, File, HTTPException
+from fastapi.responses import JSONResponse
+from datetime import datetime
 from pypdf import PdfReader
 from pgml import Collection, Model, Pipeline, Splitter
 from FlagEmbedding import FlagReranker
@@ -71,9 +75,14 @@ async def upsert_documents(collection_name: str, documents: Annotated[list[dict]
 
 
 @router.post("/documents/upload")
-async def upload_document(collection_name: Annotated[str, Form()], file_type: Annotated[str, Form()], document: Annotated[UploadFile, File()]):
+async def upload_document(
+    collection_name: Annotated[str, Form()],
+    file_type: Annotated[str, Form()],
+    document: Annotated[UploadFile, File()]
+):
     collection = Collection(collection_name)
     contents = await document.read()
+
     if file_type == "markdown":
         html = markdown(contents)
         text = ''.join(BeautifulSoup(html, features='html.parser').find_all(text=True))
@@ -81,9 +90,8 @@ async def upload_document(collection_name: Annotated[str, Form()], file_type: An
             "id": document.filename,
             "text": str(text),
         }]
-
         await collection.upsert_documents(documents)
-    else:
+    elif file_type == "pdf":
         reader = PdfReader(io.BytesIO(contents))
         for page in reader.pages:
             documents = [{
@@ -91,6 +99,21 @@ async def upload_document(collection_name: Annotated[str, Form()], file_type: An
                 "text": page.extract_text(),
             }]
             await collection.upsert_documents(documents)
+    elif file_type == "confluence":
+
+        confluence_params = {
+            "url": "your_confluence_url",
+            "username": "your_confluence_username",
+            "token": "your_confluence_token",
+            "out_dir": "your_output_directory",
+            "space": "your_confluence_space",
+            "no_attach": False,  # Set to True or False based on your requirements
+            "no_fetch": False,   # Set to True or False based on your requirements
+        }
+
+        # Create an instance of ConfluenceExporter and run it
+        exporter = ConfluenceImporter(confluence_params)
+        exporter.run()
 
     return status.HTTP_200_OK
 
@@ -124,18 +147,21 @@ async def archive_collection(collection_name: str):
 @router.post("/chat/query")
 async def chat_with_model(prompt: Prompt):
     relevant_document = await find_most_relevant_document(prompt.collection_name, prompt.pipeline_name, prompt.query, prompt.limit)
+    print(relevant_document)
     formatted_user_message = user_message.format(query=prompt.query, context=relevant_document)
     model_input_string = chatbot_input_string.format(user_message=formatted_user_message)
 
     config = Config(max_new_tokens=256, context_length=3000, stop=["<|im_end|>"])
     auto_config = AutoConfig(config=config)
     model = AutoModelForCausalLM.from_pretrained("TheBloke/Mistral-7B-OpenOrca-GGUF", model_file="mistral-7b-openorca.Q4_K_M.gguf", model_type="mistral", gpu_layers=0, config=auto_config)
+
     return StreamingResponse(chat_model_response_streamer(model, model_input_string), media_type="application/json")
 
 
 async def chat_model_response_streamer(model: LLM, query: str):
     for chunk in model(query):
         yield json.dumps({"response": chunk})
+        print(chunk)
         await asyncio.sleep(0.1)
 
 
@@ -153,4 +179,59 @@ async def find_most_relevant_document(collection_name: str, pipeline_name: str, 
 
 @router.get("/models")
 async def get_models():
-    return "mistral"
+    models_data = []
+
+    model_paths = ["mistral:latest", "/path/to/model2"]
+
+    for model_path in model_paths:
+        model_name = model_path
+        modified_at = datetime.now().isoformat()
+        size = 10000
+
+        model_info = {
+            "name": model_name,
+            "modified_at": modified_at,
+            "size": size
+        }
+
+        models_data.append(model_info)
+
+    response_data = {"models": models_data}
+    return JSONResponse(content=response_data)
+
+
+def get_model_details(model_name):
+    # Example model path, replace this with your logic to fetch the actual model details
+    model_path = f"/path/to/{model_name}"
+
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    modified_at = datetime.utcfromtimestamp(os.path.getmtime(model_path)).isoformat()
+    size = os.path.getsize(model_path)
+
+    # Replace the following placeholders with your logic to fetch specific model details
+    license_content = "<contents of license block>"
+    modelfile_content = "# Modelfile content"
+    parameters_content = "stop                           [INST]\nstop                           [/INST]\nstop                           <<SYS>>\nstop                           <</SYS>>"
+    template_content = "[INST] {{ if and .First .System }}<<SYS>>{{ .System }}<</SYS>>\n\n{{ end }}{{ .Prompt }} [/INST] "
+
+    model_details = {
+        "license": license_content,
+        "modelfile": modelfile_content,
+        "parameters": parameters_content,
+        "template": template_content,
+        "modified_at": modified_at,
+        "size": size
+    }
+
+    return model_details
+
+@router.post("/show")
+async def show_model(name: str):
+    try:
+        model_details = get_model_details(name)
+        return JSONResponse(content=model_details)
+    except HTTPException as e:
+        return JSONResponse(content={"error": str(e)}, status_code=e.status_code)
+
