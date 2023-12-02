@@ -1,9 +1,8 @@
 fastapi~=0.103.2
-pgml~=0.9.3
+pgml~=0.10.0
 python-dotenv~=1.0.0
 pydantic<2
 python-multipart~=0.0.6
-ctransformers>=0.2.24
 FlagEmbedding~=1.1.2
 Markdown~=3.5
 beautifulsoup4~=4.12.2
@@ -15,3 +14,6 @@ pypdf~=3.17.1
 requests~=2.31.0
 atlassian-python-api~=3.41.2
 markdownify~=0.11.6
+anyio~=3.7.1
+starlette~=0.27.0
+sse_starlette~=1.8.2
