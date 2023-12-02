@@ -3,6 +3,8 @@ import io
 import os
 from typing import Annotated
 
+from anyio.streams.memory import MemoryObjectSendStream
+
 from app.confluence_importer import ConfluenceImporter
 from fastapi import APIRouter, Body, status, UploadFile, Form, File, HTTPException
 from fastapi.responses import JSONResponse
@@ -13,10 +15,14 @@ from FlagEmbedding import FlagReranker
 from pydantic import BaseModel
 from markdown import markdown
 from bs4 import BeautifulSoup
-from ctransformers import AutoModelForCausalLM, LLM, AutoConfig, Config
-from fastapi.responses import StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
+from llama_cpp import Llama
+from sse_starlette.sse import EventSourceResponse
+from functools import partial
+from typing import Iterator
 import numpy as np
 import json
+import anyio
 
 example_documents = [
         {
@@ -39,16 +45,10 @@ Documents
 {context}
 """
 
-chatbot_input_string = """<|im_start|>system
-You are a helpful assistant<|im_end|>
-<|im_start|>user
-{user_message}<|im_end|>
-<|im_start|>assistant"""
-
 
 router = APIRouter(
     prefix="/collections",
-    tags=["collections"]
+    tags=["collections"],
 )
 
 
@@ -66,6 +66,21 @@ class Prompt(BaseModel):
 
 class PromptStreamingResponse(BaseModel):
     response: str
+
+
+global llm
+
+
+@router.on_event("startup")
+def llm_init():
+    global llm
+    llm = Llama(model_path="./models/mistral-7b-openorca.Q4_K_M.gguf", chat_format='chatml', n_ctx=2048)
+
+
+@router.on_event("shutdown")
+def llm_del():
+    global llm
+    del llm
 
 
 @router.post("/documents/upsert")
@@ -148,21 +163,37 @@ async def archive_collection(collection_name: str):
 async def chat_with_model(prompt: Prompt):
     relevant_document = await find_most_relevant_document(prompt.collection_name, prompt.pipeline_name, prompt.query, prompt.limit)
     print(relevant_document)
-    formatted_user_message = user_message.format(query=prompt.query, context=relevant_document)
-    model_input_string = chatbot_input_string.format(user_message=formatted_user_message)
 
-    config = Config(max_new_tokens=256, context_length=3000, stop=["<|im_end|>"])
-    auto_config = AutoConfig(config=config)
-    model = AutoModelForCausalLM.from_pretrained("TheBloke/Mistral-7B-OpenOrca-GGUF", model_file="mistral-7b-openorca.Q4_K_M.gguf", model_type="mistral", gpu_layers=0, config=auto_config)
+    message = llm.create_chat_completion(
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {
+                "role": "user",
+                "content": user_message.format(query=prompt.query, context=relevant_document)
+            }
+        ],
+        stream=True,
+        stop="<|im_end|>"
+    )
 
-    return StreamingResponse(chat_model_response_streamer(model, model_input_string), media_type="application/json")
+    send_channel, receive_channel = anyio.create_memory_object_stream()
+    return EventSourceResponse(receive_channel, data_sender_callable=partial(
+        get_message_iterator,
+        send_channel=send_channel,
+        iterator=message,
+
+    ))
 
 
-async def chat_model_response_streamer(model: LLM, query: str):
-    for chunk in model(query):
-        yield json.dumps({"response": chunk})
-        print(chunk)
-        await asyncio.sleep(0.1)
+async def get_message_iterator(send_channel: MemoryObjectSendStream, iterator: Iterator):
+    async with send_channel:
+        try:
+            async for chunk in iterate_in_threadpool(iterator):
+                await send_channel.send(dict(data=json.dumps(chunk)))
+        except anyio.get_cancelled_exc_class() as e:
+            print("disconneced")
+            with anyio.move_on_after(1, shield=True):
+                raise e
 
 
 async def find_most_relevant_document(collection_name: str, pipeline_name: str, query: str, limit: int):
