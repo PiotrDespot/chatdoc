@@ -1,1 +1,14 @@
-DATABASE_URL=
+# Database config
+DATABASE_URL=your_database_url
+BM25_INDEX_ENABLED=False
+HNSW_INDEX_ENABLED=True
+DOCUMENT_SEARCH=rrf
+
+# Confluence config
+CONFLUENCE_URL=your_confluence_url
+CONFLUENCE_USERNAME=your_confluence_username
+CONFLUENCE_TOKEN=your_confluence_token
+CONFLUENCE_OUT_DIR=your_confluence_out_dir
+CONFLUENCE_SPACE=your_confluence_space
+NO_ATTACH=False
+NO_FETCH=False
