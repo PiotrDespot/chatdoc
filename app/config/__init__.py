@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     no_attach: bool
     no_fetch: bool
 
-    model_config = SettingsConfigDict(env_file="/home/nbpdespotmladanowicz/personal-llm-projects/chatdoc/.env")
+    llm_path: str
+
+    model_config = SettingsConfigDict(env_file="./.env")
 
 
 @lru_cache()

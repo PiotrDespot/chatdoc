@@ -12,3 +12,6 @@ CONFLUENCE_OUT_DIR=your_confluence_out_dir
 CONFLUENCE_SPACE=your_confluence_space
 NO_ATTACH=False
 NO_FETCH=False
+
+# Model config
+LLM_PATH=your_llm_path
